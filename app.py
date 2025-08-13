@@ -4,14 +4,15 @@ import pandas as pd
 from collections import defaultdict
 import re
 from io import BytesIO
+from urllib.parse import quote  # <<< 关键：对 sheet 名 URL 编码
 
 st.set_page_config(page_title="Daily Consumption Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption Check (Google Sheets + One-click Check)")
 
-# ========= 配置区（用“工作表名称”读取；无需 gid） =========
-SPREADSHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"  # 你的表 ID
+# ========= 你的 Google Sheets =========
+SPREADSHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"  # ← 换成你的
 
-# 右侧是 Google Sheets 底部标签显示名（与你的表一致）
+# 右侧是底部标签页的“显示名”，需与 Google 表格底部标签完全一致
 SHEET_TITLES = {
     "raw_unit":     "raw unit calculation",
     "raw_to_semi":  "raw to semi",
@@ -25,9 +26,9 @@ SHEET_TITLES = {
     "pm_semi":      "PM_Ending_semi",
     "prod_qty":     "Dish_Production",
 }
-EMBED_SHEET_TITLE = SHEET_TITLES["prod_qty"]   # 侧栏 iframe 打开的默认标签（进入后可自行切换）
+EMBED_DEFAULT_GID = "0"  # 侧栏 iframe 默认打开的 gid（进入后用户可自行切换标签）
 
-# ========= 固定工作表&列定义 =========
+# ========= 固定工作表与列定义 =========
 SHEETS = {
     "raw_unit":       ("raw unit calculation", ["Name", "Unit calculation", "Type"]),
     "raw_to_semi":    ("raw to semi",         ["Semi/100g", "Made From", "Quantity", "Unit"]),
@@ -42,7 +43,7 @@ SHEETS = {
     "prod_qty":       ("Dish_Production",     ["Product", "Quantity"]),
 }
 
-# ========= 小工具 & 计算逻辑 =========
+# ========= 工具 & 算法 =========
 def _norm(s):
     if pd.isna(s): return ""
     return str(s).strip()
@@ -84,9 +85,11 @@ def build_pack_map(dfs):
         if not m:
             continue
         qty, base_u, pack_u = m.groups()
-        base_u = norm_unit(base_u)
-        pack_u = norm_unit(pack_u)
-        pack_map[name.lower()] = {"base_qty": float(qty), "base_unit": base_u, "pack_unit": pack_u}
+        pack_map[name.lower()] = {
+            "base_qty": float(qty),
+            "base_unit": norm_unit(base_u),
+            "pack_unit": norm_unit(pack_u),
+        }
     return pack_map
 
 def convert_to_base(name, qty, unit, pack_map):
@@ -101,10 +104,11 @@ def convert_to_base(name, qty, unit, pack_map):
     return qty
 
 def build_bom_maps(dfs):
-    semi_raw  = defaultdict(lambda: defaultdict(float))
-    semi_semi = defaultdict(lambda: defaultdict(float))
-    prod_semi = defaultdict(lambda: defaultdict(float))
-    prod_raw  = defaultdict(lambda: defaultdict(float))
+    from collections import defaultdict as dd
+    semi_raw  = dd(lambda: dd(float))
+    semi_semi = dd(lambda: dd(float))
+    prod_semi = dd(lambda: dd(float))
+    prod_raw  = dd(lambda: dd(float))
     for _, r in dfs["raw_to_semi"].iterrows():
         semi_raw[_norm(r["Semi/100g"])][_norm(r["Made From"])] += _num(r["Quantity"])
     for _, r in dfs["semi_to_semi"].iterrows():
@@ -152,10 +156,7 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
         act  = actual_map.get(name, 0.0)
         diff = act - theo
         if abs(theo) < 1e-9:
-            if abs(act) < 1e-9:
-                pct = 0.0
-            else:
-                pct = 1.0 if diff > 0 else -1.0
+            pct = 0.0 if abs(act) < 1e-9 else (1.0 if diff > 0 else -1.0)
         else:
             pct = diff / theo
         if pct > pct_tol:       color = "red"    # 多用
@@ -184,11 +185,11 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     )
     return html, df_out
 
-# ========= Google Sheets 抓取（按“标签名称”导出 CSV） =========
+# ========= Google Sheets 抓取（按“标签名称”导出 CSV；支持空格） =========
 def fetch_csv_df_by_title(spreadsheet_id: str, sheet_title: str, expected_cols: list[str]) -> pd.DataFrame:
     url = (
         f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/export"
-        f"?format=csv&sheet={sheet_title}"
+        f"?format=csv&sheet={quote(sheet_title)}"   # <<< 关键：对 sheet 名编码
     )
     df = pd.read_csv(url).dropna(how="all")
     keep = [c for c in df.columns if c in expected_cols]
@@ -225,16 +226,14 @@ def export_workbook(dfs: dict) -> BytesIO:
     output.seek(0)
     return output
 
-# ========= 左侧：嵌入 Google Sheet + 控件 =========
+# ========= 侧栏：内嵌在线表 & 控件 =========
 with st.sidebar:
     st.header("📄 在线表（可协作编辑）")
-    # 这里随便给个 gid 进入页面即可，用户在表内可自行切换标签编辑
-    edit_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid=0"
+    edit_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={EMBED_DEFAULT_GID}"
     st.components.v1.iframe(edit_url, height=600)
 
     st.divider()
-    pct = st.slider("容差（±%）", 5, 50, 15, step=1)
-    PCT_TOLERANCE = pct / 100
+    pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
     run_btn = st.button("抓取最新并校验")
 
 # ========= 运行校验 =========
@@ -242,7 +241,7 @@ if run_btn:
     with st.spinner("正在从 Google Sheets 抓取并校验…"):
         dfs = load_book_from_gs(SPREADSHEET_ID)
 
-        # 计算理论与实际
+        # 计算理论
         pack_map = build_pack_map(dfs)
         semi_raw, semi_semi, prod_semi, prod_raw = build_bom_maps(dfs)
         prod_qty = read_production(dfs)
@@ -273,8 +272,8 @@ if run_btn:
             actual_semi[name] = am_semi.get(name,0.0) - pm_semi.get(name,0.0)
 
         # 报告
-        raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  PCT_TOLERANCE)
-        semi_html, semi_df = compare_and_report(theo_semi, actual_semi, "SEMI", PCT_TOLERANCE)
+        raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  pct)
+        semi_html, semi_df = compare_and_report(theo_semi, actual_semi, "SEMI", pct)
 
     st.markdown(raw_html,  unsafe_allow_html=True)
     st.markdown(semi_html, unsafe_allow_html=True)
