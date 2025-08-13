@@ -171,19 +171,51 @@ if uploaded_file is not None:
         return actual_raw, actual_semi
 
     def compare_and_report(theoretical_map, actual_map, label):
-        rows = []
-        for name in sorted(set(theoretical_map) | set(actual_map)):
-            theo = theoretical_map.get(name, 0.0)
-            act = actual_map.get(name, 0.0)
-            diff = act - theo
-            pct = diff / theo if theo != 0 else 1.0
-            if abs(pct) > PCT_TOLERANCE:
-                color = "red" if diff > 0 else "green"
-                rows.append(f"<tr><td>{name}</td><td>{theo:.2f}</td><td>{act:.2f}</td><td style='color:{color}'>{diff:.2f} ({pct:.0%})</td></tr>")
-        if rows:
-            return f"<h3>{label} Issues</h3><table border=1><tr><th>Name</th><th>Theoretical</th><th>Actual</th><th>Diff</th></tr>{''.join(rows)}</table>"
+    rows = []
+    for name in sorted(set(theoretical_map) | set(actual_map)):
+        theo = theoretical_map.get(name, 0.0)
+        act  = actual_map.get(name, 0.0)
+        diff = act - theo
+
+        # 计算 Diff%
+        if abs(theo) < 1e-9:
+            if abs(act) < 1e-9:
+                pct = 0.0               # 0/0 → 0%
+            else:
+                pct = 1.0 if diff > 0 else -1.0  # 理论为0但有数 → 视为 ±100%
         else:
-            return f"<h3>{label} Pass ✅</h3>"
+            pct = diff / theo
+
+        # 颜色规则：红=用多、绿=用少、黑=容差内
+        if pct > PCT_TOLERANCE:
+            color = "red"        # overuse
+        elif pct < -PCT_TOLERANCE:
+            color = "green"      # underuse
+        else:
+            color = "black"      # within tolerance
+
+        # 只在“超出容差或理论为0但有消耗”时才列为 issue；否则不进表
+        if color != "black":
+            rows.append(
+                f"<tr>"
+                f"<td>{name}</td>"
+                f"<td>{theo:.2f}</td>"
+                f"<td>{act:.2f}</td>"
+                f"<td style='color:{color}'>{diff:.2f} ({pct:+.0%})</td>"
+                f"</tr>"
+            )
+
+    if rows:
+        return (
+            f"<h3>{label} Issues</h3>"
+            f"<table border=1>"
+            f"<tr><th>Name</th><th>Theoretical</th><th>Actual</th><th>Diff</th></tr>"
+            f"{''.join(rows)}"
+            f"</table>"
+        )
+    else:
+        return f"<h3>{label} Pass ✅</h3>"
+
 
     # ====== 主逻辑 ======
     dfs = load_wb(uploaded_file)
