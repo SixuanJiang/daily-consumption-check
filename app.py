@@ -8,7 +8,7 @@ from io import BytesIO
 from urllib.parse import quote
 from collections import defaultdict
 
-# ============ 页面与常量 ============
+# ================= 页面与常量 =================
 st.set_page_config(page_title="Daily Consumption Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption Check (Google Sheets + One-click Check)")
 
@@ -35,7 +35,7 @@ UNIT_SYNONYMS = {
 BASE_UNIT_SYNONYMS = {"pieces":"piece","pcs":"piece","pc":"piece"}
 RE_UNITCALC = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$', re.IGNORECASE)
 
-# ============ 小工具 ============
+# ================= 小工具 =================
 def _norm(s):
     if pd.isna(s): return ""
     return str(s).strip()
@@ -56,6 +56,7 @@ def _clean_header(name: str) -> str:
     return s
 
 def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: str) -> pd.DataFrame:
+    """清洗列名、做常见别名映射，缺列直接提示并补空列。"""
     df = df.copy()
     df.columns = [_clean_header(c) for c in df.columns]
 
@@ -81,7 +82,7 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
         )
         for m in missing:
             df[m] = None
-    # 调整顺序，必需列在前
+
     ordered = [*required_cols, *[c for c in df.columns if c not in required_cols]]
     df = df[ordered]
     return df
@@ -92,13 +93,14 @@ def norm_unit(u: str) -> str:
     u = BASE_UNIT_SYNONYMS.get(u, u)
     return u
 
-# ============ 业务函数 ============
+# ================= 业务函数 =================
 def build_pack_map(dfs):
+    """raw unit calculation -> 每包换算到 g/ml/piece"""
     pack_map = {}
     df = dfs["raw_unit"]
     for _, r in df.iterrows():
-        name = _norm(r.get("Name"))
-        rule = _norm(r.get("Unit calculation"))
+        name = _norm(r.get("Name", ""))
+        rule = _norm(r.get("Unit calculation", ""))
         if not name or not rule:
             continue
         m = RE_UNITCALC.match(rule)
@@ -130,20 +132,48 @@ def build_bom_maps(dfs):
     semi_semi = defaultdict(lambda: defaultdict(float))
     prod_semi = defaultdict(lambda: defaultdict(float))
     prod_raw  = defaultdict(lambda: defaultdict(float))
-    for _, r in dfs["raw_to_semi"].iterrows():
-        semi_raw[_norm(r["Semi/100g"])][_norm(r["Made From"])] += _num(r["Quantity"])
-    for _, r in dfs["semi_to_semi"].iterrows():
-        semi_semi[_norm(r["Semi/Unit"])][_norm(r["Made From"])] += _num(r["Quantity"])
-    for _, r in dfs["semi_to_prod"].iterrows():
-        prod_semi[_norm(r["Product/Bowl"])][_norm(r["Made From"])] += _num(r["Quantity"])
-    for _, r in dfs["raw_to_prod"].iterrows():
-        prod_raw[_norm(r["Product"])][_norm(r["Made From"])] += _num(r["Quantity"])
+
+    df = dfs["raw_to_semi"]
+    for _, r in df.iterrows():
+        semi = _norm(r.get("Semi/100g", ""))
+        raw  = _norm(r.get("Made From", ""))
+        q    = _num(r.get("Quantity", 0))
+        if semi and raw:
+            semi_raw[semi][raw] += q
+
+    df = dfs["semi_to_semi"]
+    for _, r in df.iterrows():
+        parent = _norm(r.get("Semi/Unit", ""))
+        child  = _norm(r.get("Made From", ""))
+        q      = _num(r.get("Quantity", 0))
+        if parent and child:
+            semi_semi[parent][child] += q
+
+    df = dfs["semi_to_prod"]
+    for _, r in df.iterrows():
+        prod = _norm(r.get("Product/Bowl", ""))
+        semi = _norm(r.get("Made From", ""))
+        q    = _num(r.get("Quantity", 0))
+        if prod and semi:
+            prod_semi[prod][semi] += q
+
+    df = dfs["raw_to_prod"]
+    for _, r in df.iterrows():
+        prod = _norm(r.get("Product", ""))
+        raw  = _norm(r.get("Made From", ""))
+        q    = _num(r.get("Quantity", 0))
+        if prod and raw:
+            prod_raw[prod][raw] += q
+
     return semi_raw, semi_semi, prod_semi, prod_raw
 
 def read_production(dfs):
     prod_qty = defaultdict(float)
     for _, r in dfs["prod_qty"].iterrows():
-        prod_qty[_norm(r["Product"])] += _num(r["Quantity"])
+        prod = _norm(r.get("Product", ""))
+        q = _num(r.get("Quantity", 0))
+        if prod:
+            prod_qty[prod] += q
     return prod_qty
 
 def expand_semi_demand(prod_qty, prod_semi, semi_semi):
@@ -180,9 +210,9 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
             pct = 0.0 if abs(act) < 1e-9 else (1.0 if diff > 0 else -1.0)
         else:
             pct = diff / theo
-        if pct > pct_tol:       color = "red"
-        elif pct < -pct_tol:    color = "green"
-        else:                   color = "black"
+        if pct > pct_tol:       color = "red"    # 多用
+        elif pct < -pct_tol:    color = "green"  # 少用
+        else:                   color = "black"  # 容差内
         if color != "black":
             items.append((abs(diff), name, theo, act, diff, pct, color))
 
@@ -206,9 +236,9 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     )
     return html, df_out
 
-# ============ Google Sheets 读取 ============
+# ================= Google Sheets 读取 =================
 def gs_export_csv_url(sheet_id: str, tab_name: str) -> str:
-    # 注意 sheet 参数要 URL 编码（tab 名大小写与空格必须与底部标签完全一致）
+    # 注意 tab 名大小写/空格必须与底部标签完全一致
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(tab_name)}"
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -219,7 +249,7 @@ def load_from_gs(sheet_id: str):
         url = gs_export_csv_url(sheet_id, tab)
         try:
             df = pd.read_csv(url, dtype=str).fillna("")
-            # 尝试把数量列转为数字，其他保持字符串
+            # 尝试把数量列转为数字
             for c in df.columns:
                 if c.lower() in ("quantity",):
                     df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -230,7 +260,7 @@ def load_from_gs(sheet_id: str):
             dfs[key] = pd.DataFrame(columns=cols)
     return dfs, errors
 
-# ============ 上传 Excel 读取 ============
+# ================= 上传 Excel 读取 =================
 def load_from_xlsx(file):
     xls = pd.ExcelFile(file)
     dfs = {}
@@ -262,8 +292,7 @@ def export_workbook(dfs):
     output.seek(0)
     return output
 
-# ============ 界面：数据源 ============
-
+# ================= 界面：数据源 =================
 with st.sidebar:
     st.header("📁 数据源")
     src = st.radio("选择数据源", ["Google Sheets", "上传 Excel"], horizontal=True)
@@ -297,6 +326,7 @@ if src == "Google Sheets":
 else:
     col_app = st.container()
 
+# ================= 主逻辑：运行校验 =================
 with col_app:
     st.subheader("校验结果")
     if run:
@@ -312,8 +342,15 @@ with col_app:
                     st.stop()
                 dfs, errs = load_from_xlsx(up)
 
+            # 任何读取告警先提示
             for msg in errs:
                 st.warning(msg)
+
+            # 调试：各表当前列名快照，方便定位列名不一致问题
+            with st.expander("🔎 调试：各表当前列名（运行时快照）", expanded=False):
+                for key, (tab, req) in SHEETS.items():
+                    cols_now = list(dfs[key].columns) if key in dfs else []
+                    st.write(f"**{tab}** → {cols_now}")
 
             # ——— 计算 ———
             pack_map = build_pack_map(dfs)
@@ -323,34 +360,52 @@ with col_app:
             theo_raw  = calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw)
             theo_semi = total_semi_need
 
-            # 实际
+            # 实际（RAW：AM + Purchases - PM）
             am_raw = defaultdict(float); purch = defaultdict(float); pm_raw = defaultdict(float)
             for _, r in dfs["am_raw"].iterrows():
-                am_raw[_norm(r["Ingredient"])] += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                ing  = _norm(r.get("Ingredient", ""))
+                qty  = _num(r.get("Quantity", 0))
+                unit = _norm(r.get("Unit", ""))
+                if ing:
+                    am_raw[ing] += convert_to_base(ing, qty, unit, pack_map)
             for _, r in dfs["purch_raw"].iterrows():
-                purch[_norm(r["Ingredient"])]   += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                ing  = _norm(r.get("Ingredient", ""))
+                qty  = _num(r.get("Quantity", 0))
+                unit = _norm(r.get("Unit", ""))
+                if ing:
+                    purch[ing] += convert_to_base(ing, qty, unit, pack_map)
             for _, r in dfs["pm_raw"].iterrows():
-                pm_raw[_norm(r["Ingredient"])]  += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                ing  = _norm(r.get("Ingredient", ""))
+                qty  = _num(r.get("Quantity", 0))
+                unit = _norm(r.get("Unit", ""))
+                if ing:
+                    pm_raw[ing] += convert_to_base(ing, qty, unit, pack_map)
             actual_raw = defaultdict(float)
             for name in set(am_raw) | set(purch) | set(pm_raw):
                 actual_raw[name] = am_raw.get(name,0.0) + purch.get(name,0.0) - pm_raw.get(name,0.0)
 
+            # 实际（SEMI：AM - PM）
             am_semi = defaultdict(float); pm_semi = defaultdict(float)
             for _, r in dfs["am_semi"].iterrows():
-                am_semi[_norm(r["Semi"])] += _num(r["Quantity"])
+                semi = _norm(r.get("Semi", ""))
+                if semi:
+                    am_semi[semi] += _num(r.get("Quantity", 0))
             for _, r in dfs["pm_semi"].iterrows():
-                pm_semi[_norm(r["Semi"])] += _num(r["Quantity"])
+                semi = _norm(r.get("Semi", ""))
+                if semi:
+                    pm_semi[semi] += _num(r.get("Quantity", 0))
             actual_semi = defaultdict(float)
             for name in set(am_semi) | set(pm_semi):
                 actual_semi[name] = am_semi.get(name,0.0) - pm_semi.get(name,0.0)
 
-            # 报告
+            # 报告（红=用多，绿=用少，容差内不显示）
             raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  pct)
             semi_html, semi_df = compare_and_report(theo_semi, actual_semi, "SEMI", pct)
 
         st.markdown(raw_html,  unsafe_allow_html=True)
         st.markdown(semi_html, unsafe_allow_html=True)
 
+        # 下载 Issues CSV
         if not raw_df.empty or not semi_df.empty:
             out = pd.concat([raw_df, semi_df], ignore_index=True)
             st.download_button(
@@ -360,7 +415,7 @@ with col_app:
                 mime="text/csv"
             )
 
-# ============ 备用：导出当前数据到 Excel（仅当是上传/已读入时可用） ============
+# ================= 备用：导出当前数据到 Excel =================
 with st.expander("⬇️ 导出当前工作簿（.xlsx）"):
     st.write("当你是从 Google Sheets 拉取时，这里导出的仅是当前拉取到的快照。")
     if src == "Google Sheets":
@@ -376,7 +431,7 @@ with st.expander("⬇️ 导出当前工作簿（.xlsx）"):
             st.download_button("点击下载", data=buf, file_name="inventory.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ============ 填表规范 ============
+# ================= 填表规范 =================
 with st.expander("📘 填表规范（点开查看）"):
     st.markdown("""
 - **必须的工作表与列名（严格匹配）**  
@@ -392,5 +447,7 @@ with st.expander("📘 填表规范（点开查看）"):
 - **颜色规则**：红=用多（> +容差），绿=用少（< −容差）；当 **Theoretical=0** 且有消耗时，按 **±100%** 显示。  
 - **单位**：`g / ml / piece` 或包单位（bag/box/can/bottle…）；包单位换算在 **raw unit calculation** 的 `Unit calculation` 里配置（如 `100g/can`）。  
 - **列名清洗**：自动去不可见字符/多余空格，常见别名会被自动映射（如 `qty`→`Quantity`），缺列会在页面直接提示。
+""")
+
 """)
 
