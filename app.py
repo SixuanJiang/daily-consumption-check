@@ -169,12 +169,11 @@ if uploaded_file is not None:
             actual_semi[name] = am_semi.get(name, 0.0) - pm_semi.get(name, 0.0)
 
         return actual_raw, actual_semi
-
-    def compare_and_report(theoretical_map, actual_map, label):
+def compare_and_report(theoretical_map, actual_map, label):
     rows = []
     for name in sorted(set(theoretical_map) | set(actual_map)):
         theo = theoretical_map.get(name, 0.0)
-        act  = actual_map.get(name, 0.0)
+        act = actual_map.get(name, 0.0)
         diff = act - theo
 
         # 计算 Diff%
@@ -194,7 +193,7 @@ if uploaded_file is not None:
         else:
             color = "black"      # within tolerance
 
-        # 只在“超出容差或理论为0但有消耗”时才列为 issue；否则不进表
+        # 只在“超出容差或理论为0但有消耗”时才列为 issue
         if color != "black":
             rows.append(
                 f"<tr>"
@@ -215,6 +214,8 @@ if uploaded_file is not None:
         )
     else:
         return f"<h3>{label} Pass ✅</h3>"
+
+    
 
 
     # ====== 主逻辑 ======
