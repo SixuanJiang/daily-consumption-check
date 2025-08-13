@@ -1,16 +1,20 @@
+# app.py
 import streamlit as st
 import pandas as pd
-import requests, urllib.parse, re
+import requests
+import urllib.parse
+import re
+from io import StringIO
 from collections import defaultdict
 
-# ================== 基础设置 ==================
+# ─────────────────────────── 基本设置 ───────────────────────────
 st.set_page_config(page_title="Daily Consumption Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption Check (Google Sheets + One-click Check)")
 
-# 👉 改成你的 Google Sheet ID（就是链接里 /d/ 后面那串）
+# 你的 Google Sheet ID（保持和你发的一致）
 SHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"
 
-# 你表里用到的工作表（**名字要与下方完全一致**）
+# 每个 tab 的名称（必须和表里的 sheet 名严格一致）与所需列
 SHEETS = {
     "raw_unit":       ("raw unit calculation", ["Name", "Unit calculation", "Type"]),
     "raw_to_semi":    ("raw to semi",         ["Semi/100g", "Made From", "Quantity", "Unit"]),
@@ -25,7 +29,7 @@ SHEETS = {
     "prod_qty":       ("Dish_Production",     ["Product", "Quantity"]),
 }
 
-# ================== 工具函数 ==================
+# ─────────────────────────── 工具函数 ───────────────────────────
 def _norm(s):
     if pd.isna(s): return ""
     return str(s).strip()
@@ -39,13 +43,10 @@ def _num(x):
         return 0.0
 
 RE_UNITCALC = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$', re.IGNORECASE)
-
-UNIT_SYNONYMS = {
-    "pcs":"piece","pc":"piece","pieces":"piece",
-    "bag":"bag","bags":"bag","box":"box","boxes":"box",
-    "btl":"bottle","bottle":"bottle","bottles":"bottle",
-    "can":"can","cans":"can",
-}
+UNIT_SYNONYMS = {"pcs":"piece","pc":"piece","pieces":"piece",
+                 "bag":"bag","bags":"bag","box":"box","boxes":"box",
+                 "btl":"bottle","bottle":"bottle","bottles":"bottle",
+                 "can":"can","cans":"can"}
 BASE_UNIT_SYNONYMS = {"pieces":"piece","pcs":"piece","pc":"piece"}
 
 def norm_unit(u: str) -> str:
@@ -56,34 +57,32 @@ def norm_unit(u: str) -> str:
 
 @st.cache_data(show_spinner=False, ttl=60)
 def load_sheet_csv(sheet_name: str) -> pd.DataFrame:
-    """从 Google Sheets 读取某个 tab（CSV 导出）；自动 URL 编码 sheet name。"""
+    """从 Google Sheets 单个 sheet 读取 CSV 并返回 DataFrame。"""
     base = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export"
     url = f"{base}?format=csv&sheet={urllib.parse.quote(sheet_name)}"
     r = requests.get(url, timeout=20)
     r.raise_for_status()
-    df = pd.read_csv(pd.compat.StringIO(r.text))
+    df = pd.read_csv(StringIO(r.text))
     return df
 
-def load_workbook_from_gsheet():
+def fetch_all_sheets() -> dict:
+    """按 SHEETS 配置批量抓取；缺失列自动补空，多余列自动忽略。"""
     dfs = {}
-    errors = []
-    for key, (sheet, cols) in SHEETS.items():
+    for key, (sheet_name, cols) in SHEETS.items():
         try:
-            df = load_sheet_csv(sheet)
-            # 仅保留我们定义的列，缺的补空，顺序对齐
+            df = load_sheet_csv(sheet_name)
+            # 只保留配置里需要的列；缺失列补空
             keep = [c for c in df.columns if c in cols]
             df = df[keep]
             for c in cols:
                 if c not in df.columns:
                     df[c] = None
             df = df[cols]
-            # 丢弃全空行
-            df = df.dropna(how="all")
             dfs[key] = df
         except Exception as e:
-            errors.append(f"读取 {sheet} 失败：{e}")
+            st.warning(f"读取 {sheet_name} 失败： {e}")
             dfs[key] = pd.DataFrame(columns=cols)
-    return dfs, errors
+    return dfs
 
 def build_pack_map(dfs):
     pack_map = {}
@@ -107,10 +106,11 @@ def build_pack_map(dfs):
     return pack_map
 
 def convert_to_base(name, qty, unit, pack_map):
-    if qty == 0: return 0.0
+    if qty == 0:
+        return 0.0
     u = norm_unit(unit)
     nm_key = _norm(name).lower()
-    if u in ["g","ml","piece"]:
+    if u in ["g", "ml", "piece"]:
         return qty
     rule = pack_map.get(nm_key)
     if rule and u == rule["pack_unit"]:
@@ -163,12 +163,12 @@ def calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw):
     return raw_need
 
 def compare_and_report(theoretical_map, actual_map, label, pct_tol):
+    """红=用多（>+tol），绿=用少（<-tol），黑=容差内；theo=0 且有消耗按±100%"""
     items = []
     for name in sorted(set(theoretical_map) | set(actual_map)):
         theo = theoretical_map.get(name, 0.0)
         act  = actual_map.get(name, 0.0)
         diff = act - theo
-        # Diff%
         if abs(theo) < 1e-9:
             if abs(act) < 1e-9:
                 pct = 0.0
@@ -176,17 +176,19 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
                 pct = 1.0 if diff > 0 else -1.0
         else:
             pct = diff / theo
-        # 颜色规则：红=多用；绿=少用；黑=容差内
-        if pct > pct_tol:       color = "red"
-        elif pct < -pct_tol:    color = "green"
-        else:                   color = "black"
+        if pct > pct_tol:
+            color = "red"
+        elif pct < -pct_tol:
+            color = "green"
+        else:
+            color = "black"
         if color != "black":
             items.append((abs(diff), name, theo, act, diff, pct, color))
 
     if not items:
         return f"<h3>{label} Pass ✅</h3>", pd.DataFrame()
 
-    items.sort(reverse=True)  # 按“偏差量”降序显示
+    items.sort(reverse=True)
     rows = [
         f"<tr><td>{name}</td><td>{theo:.2f}</td><td>{act:.2f}</td>"
         f"<td style='color:{color}'>{diff:.2f} ({pct:+.0%})</td></tr>"
@@ -203,37 +205,23 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     )
     return html, df_out
 
-# ================== 左侧：在线表格（iframe） ==================
+# ─────────────────────────── 左侧：在线表 & 容差 ───────────────────────────
 with st.sidebar:
-    st.header("📄 在线表（可协作编辑）")
-    gs_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit?usp=sharing"
+    st.subheader("📄 在线表（可协作编辑）")
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit?usp=sharing"
     st.markdown(
-        f"""
-<iframe src="https://docs.google.com/spreadsheets/d/{SHEET_ID}/preview" 
-        width="100%" height="420" frameborder="0"></iframe>
-<p><a href="{gs_url}" target="_blank">在新窗口打开 Google Sheets</a></p>
-""",
+        f'<iframe src="{sheet_url}" style="width:100%;height:460px;border:1px solid #ddd;border-radius:10px;"></iframe>',
         unsafe_allow_html=True,
     )
-
-# ================== 主操作区 ==================
-col1, col2 = st.columns([1, 2])
-with col1:
     pct_tol = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
-    run = st.button("▶️ 从 Google Sheets 拉取并校验")
-    st.caption("颜色规则：红=用多、绿=用少、黑=容差内；Theoretical=0 且有消耗时按 ±100% 显示。")
+    run = st.button("🚀 一键抓取并校验", use_container_width=True)
 
-with col2:
-    st.write("")
-
+# ─────────────────────────── 运行校验 ───────────────────────────
 if run:
     with st.spinner("正在从 Google Sheets 抓取并校验…"):
-        dfs, errs = load_workbook_from_gsheet()
-        if errs:
-            for e in errs:
-                st.warning(e)
+        dfs = fetch_all_sheets()
 
-        # 计算
+        # 计算理论 & 实际
         pack_map = build_pack_map(dfs)
         semi_raw, semi_semi, prod_semi, prod_raw = build_bom_maps(dfs)
         prod_qty = read_production(dfs)
@@ -241,7 +229,7 @@ if run:
         theo_raw  = calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw)
         theo_semi = total_semi_need
 
-        # 实际：RAW = AM + Purchases - PM
+        # 实际：RAW = AM + Purchases - PM；SEMI = AM - PM
         am_raw = defaultdict(float); purch = defaultdict(float); pm_raw = defaultdict(float)
         for _, r in dfs["am_raw"].iterrows():
             am_raw[_norm(r["Ingredient"])] += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
@@ -253,7 +241,6 @@ if run:
         for name in set(am_raw) | set(purch) | set(pm_raw):
             actual_raw[name] = am_raw.get(name,0.0) + purch.get(name,0.0) - pm_raw.get(name,0.0)
 
-        # 实际：SEMI = AM - PM
         am_semi = defaultdict(float); pm_semi = defaultdict(float)
         for _, r in dfs["am_semi"].iterrows():
             am_semi[_norm(r["Semi"])] += _num(r["Quantity"])
@@ -270,13 +257,34 @@ if run:
     st.markdown(raw_html,  unsafe_allow_html=True)
     st.markdown(semi_html, unsafe_allow_html=True)
 
+    # 下载 Issues CSV
     if not raw_df.empty or not semi_df.empty:
         out = pd.concat([raw_df, semi_df], ignore_index=True)
         st.download_button(
             "⬇️ 下载 Issues (CSV)",
             out.to_csv(index=False).encode("utf-8"),
             file_name="issues.csv",
-            mime="text/csv"
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+# ─────────────────────────── 帮助 ───────────────────────────
+with st.expander("📘 填表规范（点开查看）"):
+    st.markdown("""
+- **必须的工作表与列名（严格匹配）**  
+  - raw unit calculation: `Name`, `Unit calculation` (如 `100g/can`), `Type`  
+  - raw to semi: `Semi/100g`, `Made From`, `Quantity`, `Unit`  
+  - semi to semi: `Semi/Unit`, `Made From`, `Quantity`, `Unit`  
+  - Semi to Product: `Product/Bowl`, `Made From`, `Quantity`, `Unit`  
+  - Raw to Product: `Product`, `Made From`, `Quantity`, `Unit`  
+  - AM_Opening_Raw / Purchases_Raw / PM_Ending_Raw: `Ingredient`, `Quantity`, `Unit`  
+  - AM_Opening_semi / PM_Ending_semi: `Semi`, `Quantity`, `Unit`  
+  - Dish_Production: `Product`, `Quantity`
+
+- **颜色规则**：红=用多（> +容差），绿=用少（< −容差），黑=容差内；当 **Theoretical=0** 且有消耗时，按 **±100%** 判断。  
+- **单位**：`g / ml / piece` 或包单位（bag/box/can/bottle…）；包单位换算在 **raw unit calculation** 的 `Unit calculation` 里配置（如 `100g/can`）。
+""")
+
         )
 
 
