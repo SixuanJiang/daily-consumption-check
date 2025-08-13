@@ -8,14 +8,14 @@ from urllib.parse import urlencode, quote
 from collections import defaultdict
 import requests
 
-# ===================== 基本设置 =====================
+# ===================== App setup =====================
 st.set_page_config(page_title="Daily Consumption – Editor & Check", page_icon="📊", layout="wide")
-st.title("📊 Daily Consumption（在线编辑 + 一键校验）")
+st.title("📊 Daily Consumption (Inline Google Sheets Editor + One-click Check)")
 
-# 你的 Google Sheet ID（固定）
+# Your Google Sheet ID (fixed)
 SHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"
 
-# —— 只用 gid 抓取（你给的截图里提取到的所有 gid）——
+# —— Use only GIDs to fetch CSV ——
 SHEET_GIDS = {
     "raw unit calculation": "1286746668",
     "raw to semi":          "584726276",
@@ -30,7 +30,7 @@ SHEET_GIDS = {
     "Dish_Production":      "878974890",
 }
 
-# 需要的标签及标准列（严格匹配）
+# Required tabs and columns (strict match)
 SHEETS = {
     "raw_unit":       ("raw unit calculation", ["Name", "Unit calculation", "Type"]),
     "raw_to_semi":    ("raw to semi",         ["Semi/100g", "Made From", "Quantity", "Unit"]),
@@ -55,7 +55,7 @@ BASE_UNIT_SYNONYMS = {"pieces":"piece","pcs":"piece","pc":"piece"}
 
 RE_UNITCALC = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$', re.IGNORECASE)
 
-# ===================== 小工具 =====================
+# ===================== Helpers =====================
 def _norm(s):
     if pd.isna(s): return ""
     return str(s).strip()
@@ -94,7 +94,7 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
     df = normalize_headers_and_aliases(df)
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
-        st.error(f"【{sheet_label}】缺少必需列：{missing}。当前列：{list(df.columns)}")
+        st.error(f"[{sheet_label}] is missing required columns: {missing}. Current columns: {list(df.columns)}")
         for m in missing: df[m] = None
     for c in df.columns:
         if c.lower() == "quantity":
@@ -108,7 +108,7 @@ def norm_unit(u: str) -> str:
     u = BASE_UNIT_SYNONYMS.get(u, u)
     return u
 
-# ===================== 业务逻辑 =====================
+# ===================== Core logic =====================
 def build_pack_map(dfs):
     pack_map = {}
     df = dfs["raw_unit"]
@@ -211,19 +211,19 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     )
     return html, df_out
 
-# ===================== Google Sheets 抓取（只用 gid） =====================
+# ===================== Google Sheets fetching (GID only) =====================
 def gs_export_csv_url_by_gid(sheet_id: str, gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
 def fetch_csv_df(url: str) -> pd.DataFrame:
     try:
         r = requests.get(url, timeout=10)
-        if r.status_code == 403: raise RuntimeError("403 Forbidden：Sheet 需设为 'Anyone with the link – Viewer'（抓取 CSV）。")
-        if r.status_code == 404: raise RuntimeError("404 Not Found：sheet_id / gid 可能不对。")
+        if r.status_code == 403: raise RuntimeError("403 Forbidden: the sheet must allow 'Anyone with the link – Viewer' for CSV export.")
+        if r.status_code == 404: raise RuntimeError("404 Not Found: invalid sheet_id or gid.")
         r.raise_for_status()
         return pd.read_csv(BytesIO(r.content), dtype=str).fillna("")
     except Exception as e:
-        raise RuntimeError(f"拉取 CSV 失败：{e}")
+        raise RuntimeError(f"CSV fetch failed: {e}")
 
 @st.cache_data(show_spinner=False, ttl=60)
 def load_from_gs_using_gids(sheet_id: str):
@@ -231,7 +231,7 @@ def load_from_gs_using_gids(sheet_id: str):
     for key, (tab, cols) in SHEETS.items():
         gid = SHEET_GIDS.get(tab, "")
         if not gid:
-            errors.append(f"【{tab}】缺少 gid（请在代码的 SHEET_GIDS 中补齐）。")
+            errors.append(f"[{tab}] missing gid (fill it in SHEET_GIDS in code).")
             dfs[key] = pd.DataFrame(columns=cols)
             continue
         url = gs_export_csv_url_by_gid(sheet_id, gid)
@@ -241,7 +241,7 @@ def load_from_gs_using_gids(sheet_id: str):
             debug.append((tab, f"gid={gid}", list(df_raw.columns)[:6]))
             dfs[key] = df
         except Exception as e:
-            errors.append(f"读取 {tab} 失败（gid={gid}）：{e}")
+            errors.append(f"Read {tab} failed (gid={gid}): {e}")
             dfs[key] = pd.DataFrame(columns=cols)
     return dfs, errors, debug
 
@@ -258,33 +258,33 @@ def export_workbook(dfs):
     output.seek(0)
     return output
 
-# ===================== UI：两个 Tab =====================
-tab_edit, tab_check = st.tabs(["📝 在线编辑（原生 Google Sheets）", "✅ 一键校验"])
+# ===================== UI: two tabs =====================
+tab_edit, tab_check = st.tabs(["📝 Inline Edit (Google Sheets)", "✅ One-click Check"])
 
-# ---- Tab 1：在线编辑（iframe） ----
+# ---- Tab 1: inline editor (iframe) ----
 with tab_edit:
-    st.subheader("直接在页面里编辑 Google Sheet")
-    st.info("⚠️ 在 iframe 内可编辑：把 Google Sheet 权限设为 “Anyone with the link – **Editor**”。")
-    height = st.slider("嵌入高度（px）", 600, 1400, 900, 20, key="iframe_height")
+    st.subheader("Edit your Google Sheet right in the page")
+    st.info("To edit inside the iframe, the Google Sheet must be shared as: Anyone with the link – **Editor**.")
+    height = st.slider("Iframe height (px)", 600, 1400, 900, 20, key="iframe_height")
     base_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
-    st.link_button("在新标签页打开（编辑）", base_url, use_container_width=True)
+    st.link_button("Open in new tab (edit)", base_url, use_container_width=True)
     st.components.v1.iframe(src=base_url, height=height, scrolling=True)
 
-# ---- Tab 2：一键校验（固定 gid 抓取） ----
+# ---- Tab 2: check (fixed GIDs) ----
 with tab_check:
-    st.subheader("校验结果")
-    pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
-    run = st.button("🚀 运行校验", use_container_width=True)
+    st.subheader("Validation Results")
+    pct = st.slider("Tolerance (±%)", 5, 50, 15, step=1) / 100
+    run = st.button("🚀 Run Check", use_container_width=True)
 
     if run:
-        with st.spinner("正在从 Google Sheets 抓取并校验…"):
+        with st.spinner("Fetching from Google Sheets and validating…"):
             dfs, errs, debug = load_from_gs_using_gids(SHEET_ID)
             for tab, src, cols in debug:
-                st.caption(f"✔️ 抓取 `{tab}` via {src} → 原始列预览：{cols}")
+                st.caption(f"✔️ Loaded `{tab}` via {src} → columns preview: {cols}")
             for msg in errs:
                 st.warning(msg)
 
-            # 计算
+            # Compute
             try:
                 pack_map = build_pack_map(dfs)
                 semi_raw, semi_semi, prod_semi, prod_raw = build_bom_maps(dfs)
@@ -293,10 +293,10 @@ with tab_check:
                 theo_raw  = calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw)
                 theo_semi = total_semi_need
             except Exception as e:
-                st.error(f"构建理论用量失败：{e}")
+                st.error(f"Failed to build theoretical consumption: {e}")
                 st.stop()
 
-            # 实际
+            # Actuals
             try:
                 am_raw = defaultdict(float); purch = defaultdict(float); pm_raw = defaultdict(float)
                 for _, r in dfs["am_raw"].iterrows():
@@ -318,10 +318,10 @@ with tab_check:
                 for name in set(am_semi) | set(pm_semi):
                     actual_semi[name] = am_semi.get(name,0.0) - pm_semi.get(name,0.0)
             except Exception as e:
-                st.error(f"汇总实际用量失败：{e}")
+                st.error(f"Failed to aggregate actuals: {e}")
                 st.stop()
 
-            # 报告
+            # Report
             raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  pct)
             semi_html, semi_df = compare_and_report(theo_semi, actual_semi, "SEMI", pct)
 
@@ -331,17 +331,17 @@ with tab_check:
         if not raw_df.empty or not semi_df.empty:
             out = pd.concat([raw_df, semi_df], ignore_index=True)
             st.download_button(
-                "⬇️ 下载 Issues (CSV)",
+                "⬇️ Download Issues (CSV)",
                 out.to_csv(index=False).encode("utf-8"),
                 file_name="issues.csv",
                 mime="text/csv"
             )
 
-# ===================== 帮助 =====================
-with st.expander("📘 填表规范（点开查看）"):
+# ===================== Help =====================
+with st.expander("📘 Sheet spec"):
     st.markdown("""
-- **必须的工作表与列名（严格匹配）**  
-  - raw unit calculation: `Name`, `Unit calculation` (如 `100g/can`), `Type`  
+- **Required sheets & columns (exact match)**  
+  - raw unit calculation: `Name`, `Unit calculation` (e.g. `100g/can`), `Type`  
   - raw to semi: `Semi/100g`, `Made From`, `Quantity`, `Unit`  
   - semi to semi: `Semi/Unit`, `Made From`, `Quantity`, `Unit`  
   - Semi to Product: `Product/Bowl`, `Made From`, `Quantity`, `Unit`  
@@ -350,7 +350,7 @@ with st.expander("📘 填表规范（点开查看）"):
   - AM_Opening_semi / PM_Ending_semi: `Semi`, `Quantity`, `Unit`  
   - Dish_Production: `Product`, `Quantity`
 
-- **权限**  
-  - 在页面里编辑：Google Sheet 需设为 “Anyone with the link – **Editor**”；  
-  - 抓 CSV：至少 “Anyone with the link – Viewer”。
+- **Permissions**  
+  - Inline editing (iframe): set Google Sheet to “Anyone with the link – **Editor**”.  
+  - CSV export (for validation): at least “Anyone with the link – Viewer”.
 """)
