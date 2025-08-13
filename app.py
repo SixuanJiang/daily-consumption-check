@@ -4,7 +4,7 @@ import pandas as pd
 import re
 import unicodedata
 from io import BytesIO
-from urllib.parse import quote, urlencode
+from urllib.parse import urlencode, quote
 from collections import defaultdict
 import requests
 
@@ -12,8 +12,23 @@ import requests
 st.set_page_config(page_title="Daily Consumption – Editor & Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption（在线编辑 + 一键校验）")
 
-# 你的 Google Sheet ID（固定，不用用户输入）
+# 你的 Google Sheet ID（固定）
 SHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"
+
+# —— 只用 gid 抓取（你给的截图里提取到的所有 gid）——
+SHEET_GIDS = {
+    "raw unit calculation": "1286746668",
+    "raw to semi":          "584726276",
+    "semi to semi":         "975746819",
+    "Semi to Product":      "1139301624",
+    "Raw to Product":       "38216750",
+    "AM_Opening_Raw":       "1832884740",
+    "Purchases_Raw":        "1288563451",
+    "PM_Ending_Raw":        "11457195",
+    "AM_Opening_semi":      "772369686",
+    "PM_Ending_semi":       "880869121",
+    "Dish_Production":      "878974890",
+}
 
 # 需要的标签及标准列（严格匹配）
 SHEETS = {
@@ -30,11 +45,6 @@ SHEETS = {
     "prod_qty":       ("Dish_Production",     ["Product", "Quantity"]),
 }
 
-# 可选：为避免串表，可填某些 tab 的 gid（浏览器地址栏 ?gid= 后面的数字）
-SHEET_GIDS_DEFAULT = {
-    "raw to semi": "1286746668",
-}
-
 UNIT_SYNONYMS = {
     "pcs":"piece","pc":"piece","pieces":"piece",
     "bag":"bag","bags":"bag","box":"box","boxes":"box",
@@ -42,6 +52,7 @@ UNIT_SYNONYMS = {
     "can":"can","cans":"can",
 }
 BASE_UNIT_SYNONYMS = {"pieces":"piece","pcs":"piece","pc":"piece"}
+
 RE_UNITCALC = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$', re.IGNORECASE)
 
 # ===================== 小工具 =====================
@@ -94,18 +105,24 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
 def norm_unit(u: str) -> str:
     u = _norm(u).lower()
     u = UNIT_SYNONYMS.get(u, u)
-    return BASE_UNIT_SYNONYMS.get(u, u)
+    u = BASE_UNIT_SYNONYMS.get(u, u)
+    return u
 
 # ===================== 业务逻辑 =====================
 def build_pack_map(dfs):
     pack_map = {}
-    for _, r in dfs["raw_unit"].iterrows():
+    df = dfs["raw_unit"]
+    for _, r in df.iterrows():
         name = _norm(r.get("Name")); rule = _norm(r.get("Unit calculation"))
         if not name or not rule: continue
         m = RE_UNITCALC.match(rule)
         if not m: continue
         qty, base_u, pack_u = m.groups()
-        pack_map[name.lower()] = {"base_qty": float(qty), "base_unit": norm_unit(base_u), "pack_unit": norm_unit(pack_u)}
+        pack_map[name.lower()] = {
+            "base_qty": float(qty),
+            "base_unit": norm_unit(base_u),
+            "pack_unit": norm_unit(pack_u)
+        }
     return pack_map
 
 def convert_to_base(name, qty, unit, pack_map):
@@ -166,102 +183,106 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     for name in sorted(set(theoretical_map) | set(actual_map)):
         theo = theoretical_map.get(name, 0.0); act = actual_map.get(name, 0.0)
         diff = act - theo
-        pct = (0.0 if abs(theo) < 1e-9 else diff / theo) if not (abs(theo) < 1e-9 and abs(act) >= 1e-9) else (1.0 if diff > 0 else -1.0)
+        if abs(theo) < 1e-9:
+            pct = 0.0 if abs(act) < 1e-9 else (1.0 if diff > 0 else -1.0)
+        else:
+            pct = diff / theo
         color = "black"
         if pct > pct_tol: color = "red"
         elif pct < -pct_tol: color = "green"
-        if color != "black": items.append((abs(diff), name, theo, act, diff, pct, color))
+        if color != "black":
+            items.append((abs(diff), name, theo, act, diff, pct, color))
     if not items:
         return f"<h3>{label} Pass ✅</h3>", pd.DataFrame()
     items.sort(reverse=True)
-    rows = [f"<tr><td>{n}</td><td>{t:.2f}</td><td>{a:.2f}</td><td style='color:{c}'>{d:.2f} ({p:+.0%})</td></tr>"
-            for _, n, t, a, d, p, c in items]
-    df_out = pd.DataFrame([{"Name": n, "Theoretical": t, "Actual": a, "Diff": d, "Diff%": p, "Type": label}
-                           for _, n, t, a, d, p, c in items])
-    html = f"<h3>{label} Issues</h3><table border=1><tr><th>Name</th><th>Theoretical</th><th>Actual</th><th>Diff</th></tr>{''.join(rows)}</table>"
+    rows = [
+        f"<tr><td>{n}</td><td>{t:.2f}</td><td>{a:.2f}</td>"
+        f"<td style='color:{c}'>{d:.2f} ({p:+.0%})</td></tr>"
+        for _, n, t, a, d, p, c in items
+    ]
+    df_out = pd.DataFrame(
+        [{"Name": n, "Theoretical": t, "Actual": a, "Diff": d, "Diff%": p, "Type": label}
+         for _, n, t, a, d, p, c in items]
+    )
+    html = (
+        f"<h3>{label} Issues</h3>"
+        f"<table border=1><tr><th>Name</th><th>Theoretical</th><th>Actual</th><th>Diff</th></tr>"
+        f"{''.join(rows)}</table>"
+    )
     return html, df_out
 
-# ===================== Google Sheets 抓取 =====================
+# ===================== Google Sheets 抓取（只用 gid） =====================
 def gs_export_csv_url_by_gid(sheet_id: str, gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-
-def gs_export_csv_url_by_name(sheet_id: str, tab_name: str) -> str:
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(tab_name)}"
 
 def fetch_csv_df(url: str) -> pd.DataFrame:
     try:
         r = requests.get(url, timeout=10)
-        if r.status_code == 403: raise RuntimeError("403 Forbidden：Sheet 未对任何知道链接的人开放‘查看’。")
-        if r.status_code == 404: raise RuntimeError("404 Not Found：sheet_id / gid / sheet 名称可能不对。")
+        if r.status_code == 403: raise RuntimeError("403 Forbidden：Sheet 需设为 'Anyone with the link – Viewer'（抓取 CSV）。")
+        if r.status_code == 404: raise RuntimeError("404 Not Found：sheet_id / gid 可能不对。")
         r.raise_for_status()
         return pd.read_csv(BytesIO(r.content), dtype=str).fillna("")
     except Exception as e:
         raise RuntimeError(f"拉取 CSV 失败：{e}")
 
 @st.cache_data(show_spinner=False, ttl=60)
-def load_from_gs(sheet_id: str, name_to_gid: dict):
+def load_from_gs_using_gids(sheet_id: str):
     dfs, errors, debug = {}, [], []
     for key, (tab, cols) in SHEETS.items():
-        gid = name_to_gid.get(tab, "").strip()
-        url = gs_export_csv_url_by_gid(sheet_id, gid) if gid else gs_export_csv_url_by_name(sheet_id, tab)
-        src_hint = f"gid={gid}" if gid else f"sheet={tab}"
+        gid = SHEET_GIDS.get(tab, "")
+        if not gid:
+            errors.append(f"【{tab}】缺少 gid（请在代码的 SHEET_GIDS 中补齐）。")
+            dfs[key] = pd.DataFrame(columns=cols)
+            continue
+        url = gs_export_csv_url_by_gid(sheet_id, gid)
         try:
             df_raw = fetch_csv_df(url)
             df = normalize_and_validate(df_raw, cols, tab)
-            debug.append((tab, src_hint, list(df_raw.columns)[:6]))
+            debug.append((tab, f"gid={gid}", list(df_raw.columns)[:6]))
             dfs[key] = df
         except Exception as e:
-            errors.append(f"读取 {tab} 失败（{src_hint}）：{e}")
+            errors.append(f"读取 {tab} 失败（gid={gid}）：{e}")
             dfs[key] = pd.DataFrame(columns=cols)
     return dfs, errors, debug
+
+def export_workbook(dfs):
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as w:
+        for key, (sheet, cols) in SHEETS.items():
+            df = dfs[key].copy()
+            for c in cols:
+                if c not in df.columns:
+                    df[c] = None
+            df = df[cols]
+            df.to_excel(w, sheet_name=sheet, index=False)
+    output.seek(0)
+    return output
 
 # ===================== UI：两个 Tab =====================
 tab_edit, tab_check = st.tabs(["📝 在线编辑（原生 Google Sheets）", "✅ 一键校验"])
 
-# ---- Tab 1：在线编辑（iframe，不是 grid） ----
+# ---- Tab 1：在线编辑（iframe） ----
 with tab_edit:
-    st.subheader("直接在页面里编辑你的 Google Sheet")
-    with st.sidebar:
-        st.markdown("### 嵌入设置")
-        height = st.slider("嵌入高度（px）", 600, 1400, 900, 20)
-        gid_focus = st.text_input("可选：默认打开的标签页 gid（浏览器地址栏 ?gid= 后面的数字）", value="")
-        st.info("⚠️ 必做：在 Google Sheet → Share → General access 设为 Anyone with the link – **Editor**。")
+    st.subheader("直接在页面里编辑 Google Sheet")
+    st.info("⚠️ 在 iframe 内可编辑：把 Google Sheet 权限设为 “Anyone with the link – **Editor**”。")
+    height = st.slider("嵌入高度（px）", 600, 1400, 900, 20, key="iframe_height")
     base_url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit"
-    url = base_url if not gid_focus.strip() else base_url + "?" + urlencode({"gid": gid_focus.strip()})
-    st.caption("嵌入地址（可复制到新标签页）")
-    st.code(url, language="text")
-    st.link_button("在新标签页打开（编辑）", url, use_container_width=True)
-    st.components.v1.iframe(src=url, height=height, scrolling=True)
-    with st.expander("❓常见问题"):
-        st.markdown(
-            "- 能看但不能改：权限没开到 **Editor**。\n"
-            "- 弹登录/403：让用户使用已登录 Google 的浏览器；或直接点“在新标签页打开”。\n"
-            "- 定位标签页：在表里点到目标 tab，复制地址栏里的 `?gid=...`。"
-        )
+    st.link_button("在新标签页打开（编辑）", base_url, use_container_width=True)
+    st.components.v1.iframe(src=base_url, height=height, scrolling=True)
 
-# ---- Tab 2：一键校验（沿用你原有逻辑） ----
+# ---- Tab 2：一键校验（固定 gid 抓取） ----
 with tab_check:
     st.subheader("校验结果")
-    with st.sidebar:
-        st.markdown("### 校验参数")
-        pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
-        run = st.button("🚀 运行校验", use_container_width=True)
-        with st.expander("高级：gid 固定（避免串表）", expanded=False):
-            gid_state = {}
-            for _key, (tab_name, _cols) in SHEETS.items():
-                val = st.text_input(f"{tab_name}", value=SHEET_GIDS_DEFAULT.get(tab_name, ""))
-                gid_state[tab_name] = val
-            if st.button("保存 gid 设置", use_container_width=True):
-                st.session_state["gid_map"] = gid_state
-                st.success("已保存。")
-    gid_map = st.session_state.get("gid_map", SHEET_GIDS_DEFAULT)
+    pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
+    run = st.button("🚀 运行校验", use_container_width=True)
 
     if run:
         with st.spinner("正在从 Google Sheets 抓取并校验…"):
-            dfs, errs, debug = load_from_gs(SHEET_ID, gid_map)
+            dfs, errs, debug = load_from_gs_using_gids(SHEET_ID)
             for tab, src, cols in debug:
                 st.caption(f"✔️ 抓取 `{tab}` via {src} → 原始列预览：{cols}")
-            for msg in errs: st.warning(msg)
+            for msg in errs:
+                st.warning(msg)
 
             # 计算
             try:
@@ -272,7 +293,8 @@ with tab_check:
                 theo_raw  = calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw)
                 theo_semi = total_semi_need
             except Exception as e:
-                st.error(f"构建理论用量失败：{e}"); st.stop()
+                st.error(f"构建理论用量失败：{e}")
+                st.stop()
 
             # 实际
             try:
@@ -296,7 +318,8 @@ with tab_check:
                 for name in set(am_semi) | set(pm_semi):
                     actual_semi[name] = am_semi.get(name,0.0) - pm_semi.get(name,0.0)
             except Exception as e:
-                st.error(f"汇总实际用量失败：{e}"); st.stop()
+                st.error(f"汇总实际用量失败：{e}")
+                st.stop()
 
             # 报告
             raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  pct)
@@ -304,10 +327,15 @@ with tab_check:
 
         st.markdown(raw_html,  unsafe_allow_html=True)
         st.markdown(semi_html, unsafe_allow_html=True)
+
         if not raw_df.empty or not semi_df.empty:
             out = pd.concat([raw_df, semi_df], ignore_index=True)
-            st.download_button("⬇️ 下载 Issues (CSV)", out.to_csv(index=False).encode("utf-8"),
-                               file_name="issues.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ 下载 Issues (CSV)",
+                out.to_csv(index=False).encode("utf-8"),
+                file_name="issues.csv",
+                mime="text/csv"
+            )
 
 # ===================== 帮助 =====================
 with st.expander("📘 填表规范（点开查看）"):
@@ -321,6 +349,8 @@ with st.expander("📘 填表规范（点开查看）"):
   - AM_Opening_Raw / Purchases_Raw / PM_Ending_Raw: `Ingredient`, `Quantity`, `Unit`  
   - AM_Opening_semi / PM_Ending_semi: `Semi`, `Quantity`, `Unit`  
   - Dish_Production: `Product`, `Quantity`
-- **权限**：嵌入页想要可编辑，必须把 Google Sheet 设为 “Anyone with the link – **Editor**”。
-""")
 
+- **权限**  
+  - 在页面里编辑：Google Sheet 需设为 “Anyone with the link – **Editor**”；  
+  - 抓 CSV：至少 “Anyone with the link – Viewer”。
+""")
