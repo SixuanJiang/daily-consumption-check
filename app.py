@@ -6,12 +6,13 @@ import unicodedata
 from io import BytesIO
 from urllib.parse import quote
 from collections import defaultdict
+import requests
 
 # ===================== 基本设置 =====================
 st.set_page_config(page_title="Daily Consumption Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption Check (Google Sheets + One-click Check)")
 
-# 固定：你的 Google Sheet ID
+# 固定：你的 Google Sheet ID（已内置，不需要每次输入）
 SHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"
 
 # 需要的标签及标准列（严格匹配）
@@ -29,9 +30,9 @@ SHEETS = {
     "prod_qty":       ("Dish_Production",     ["Product", "Quantity"]),
 }
 
-# —— 可填写 gid（填了就始终按 gid 抓，不会串表）
-# 你截图里那个链接的 gid=1286746668，示例先给到 raw to semi；其余可在侧栏补齐。
+# —— 如需强指定某些标签的 gid（避免“串表”），在这里填
 SHEET_GIDS_DEFAULT = {
+    # 例：你截图里 raw to semi 的 gid
     "raw to semi": "1286746668",
 }
 
@@ -65,10 +66,10 @@ def _clean_header(name: str) -> str:
     s = " ".join(s.strip().split())
     return s
 
-def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: str) -> pd.DataFrame:
+def normalize_headers_and_aliases(df: pd.DataFrame) -> pd.DataFrame:
+    """先清洗列名，再做别名映射，最后再清洗一次。"""
     df = df.copy()
     df.columns = [_clean_header(c) for c in df.columns]
-
     alias_map = {
         "ingredient": "Ingredient", "ingredients": "Ingredient",
         "qty": "Quantity", "amount": "Quantity",
@@ -82,7 +83,12 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
         mapped = alias_map.get(key)
         new_cols.append(mapped if mapped else c)
     df.columns = [_clean_header(c) for c in new_cols]
+    return df
 
+def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: str) -> pd.DataFrame:
+    df = normalize_headers_and_aliases(df)
+
+    # 保证必需列存在
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
         st.error(
@@ -91,6 +97,11 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
         )
         for m in missing:
             df[m] = None
+
+    # 统一把名为 Quantity 的列转数值（别名映射后再转）
+    for c in df.columns:
+        if c.lower() == "quantity":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
 
     ordered = [*required_cols, *[c for c in df.columns if c not in required_cols]]
     df = df[ordered]
@@ -223,6 +234,19 @@ def gs_export_csv_url_by_gid(sheet_id: str, gid: str) -> str:
 def gs_export_csv_url_by_name(sheet_id: str, tab_name: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&sheet={quote(tab_name)}"
 
+def fetch_csv_df(url: str) -> pd.DataFrame:
+    """用 requests 加超时与清晰报错，再交给 pandas 读 CSV。"""
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 403:
+            raise RuntimeError("403 Forbidden：Google Sheet 可能未对“任何知道链接的人”开放‘可检视’。")
+        if r.status_code == 404:
+            raise RuntimeError("404 Not Found：sheet_id / gid / sheet 名称可能不对。")
+        r.raise_for_status()
+        return pd.read_csv(BytesIO(r.content), dtype=str).fillna("")
+    except Exception as e:
+        raise RuntimeError(f"拉取 CSV 失败：{e}")
+
 @st.cache_data(show_spinner=False, ttl=60)
 def load_from_gs(sheet_id: str, name_to_gid: dict):
     dfs = {}
@@ -239,13 +263,10 @@ def load_from_gs(sheet_id: str, name_to_gid: dict):
             src_hint = f"sheet={tab}"
 
         try:
-            df = pd.read_csv(url, dtype=str).fillna("")
-            debug.append((tab, src_hint, list(df.columns)[:6]))
-            # 数量列尽量转数字，其余保持字符串
-            for c in df.columns:
-                if c.lower() == "quantity":
-                    df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = normalize_and_validate(df, cols, tab)
+            df_raw = fetch_csv_df(url)
+            # 先做列名规范/别名，再统一转 Quantity 数值
+            df = normalize_and_validate(df_raw, cols, tab)
+            debug.append((tab, src_hint, list(df_raw.columns)[:6]))
             dfs[key] = df
         except Exception as e:
             errors.append(f"读取 {tab} 失败（{src_hint}）：{e}")
@@ -266,7 +287,7 @@ def export_workbook(dfs):
     output.seek(0)
     return output
 
-# ===================== 侧边栏（容差 & 高级 gid 设置） =====================
+# ===================== 侧边栏（容差 & 高级设置） =====================
 with st.sidebar:
     pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
     run = st.button("🚀 运行校验", use_container_width=True)
@@ -276,12 +297,17 @@ with st.sidebar:
         for _key, (tab_name, _cols) in SHEETS.items():
             val = st.text_input(f"{tab_name}", value=SHEET_GIDS_DEFAULT.get(tab_name, ""))
             gid_state[tab_name] = val
-        # 缓存到 session，便于下次进入还在
         if st.button("保存 gid 设置", use_container_width=True):
             st.session_state["gid_map"] = gid_state
             st.success("已保存。")
 
+    with st.expander("高级：临时覆盖 Sheet ID（可不填）", expanded=False):
+        tmp_id = st.text_input("临时 Sheet ID（留空则使用内置）", value="")
+        if tmp_id.strip():
+            st.session_state["sheet_id_override"] = tmp_id.strip()
+
 gid_map = st.session_state.get("gid_map", SHEET_GIDS_DEFAULT)
+sheet_id_effective = st.session_state.get("sheet_id_override", "").strip() or SHEET_ID
 
 # ===================== 主区：运行 =====================
 col_app = st.container()
@@ -290,9 +316,9 @@ with col_app:
 
     if run:
         with st.spinner("正在从 Google Sheets 抓取并校验…"):
-            dfs, errs, debug = load_from_gs(SHEET_ID, gid_map)
+            dfs, errs, debug = load_from_gs(sheet_id_effective, gid_map)
             for tab, src, cols in debug:
-                st.caption(f"✔️ 抓取 `{tab}` via {src} → 首列预览：{cols}")
+                st.caption(f"✔️ 抓取 `{tab}` via {src} → 原始列预览：{cols}")
 
             for msg in errs:
                 st.warning(msg)
@@ -365,7 +391,6 @@ with st.expander("📘 填表规范（点开查看）"):
 
 - **颜色规则**：红=用多（> +容差），绿=用少（< −容差）；当 **Theoretical=0** 且有消耗时，按 **±100%** 显示。  
 - **单位**：`g / ml / piece` 或包单位（bag/box/can/bottle…）；包单位换算在 **raw unit calculation** 的 `Unit calculation` 里配置（如 `100g/can`）。  
-- **列名清洗**：自动去不可见字符/多余空格，常见别名会被自动映射（如 `qty`→`Quantity`）；缺列会直接提示。
+- **列名清洗**：自动去不可见字符/多余空格，常见别名会被自动映射（如 `qty`→`Quantity`）；缺列会直接提示。  
+- **权限**：若出现 403，请把 Google Sheet 设为“Anyone with the link can view（任何知道连结的人可检视）”。
 """)
-
-
