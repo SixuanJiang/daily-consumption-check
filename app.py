@@ -7,14 +7,14 @@ from io import BytesIO
 from urllib.parse import quote
 from collections import defaultdict
 
-# ================= 页面与常量 =================
+# ===================== 基本设置 =====================
 st.set_page_config(page_title="Daily Consumption Check", page_icon="📊", layout="wide")
 st.title("📊 Daily Consumption Check (Google Sheets + One-click Check)")
 
-# 你的 Google Sheet（固定，不再需要手工输入）
+# 固定：你的 Google Sheet ID
 SHEET_ID = "11Ln80T1iUp8kAPoNhdBjS1Xi5dsxSSANhGoYPa08GoA"
 
-# 需要的工作表与标准列
+# 需要的标签及标准列（严格匹配）
 SHEETS = {
     "raw_unit":       ("raw unit calculation", ["Name", "Unit calculation", "Type"]),
     "raw_to_semi":    ("raw to semi",         ["Semi/100g", "Made From", "Quantity", "Unit"]),
@@ -29,40 +29,33 @@ SHEETS = {
     "prod_qty":       ("Dish_Production",     ["Product", "Quantity"]),
 }
 
-# —— 可选：为每个标签预设 gid（填了就优先用 gid 拉取，永不串表）
-# 复制某个标签的链接，?gid= 后面的数字就是它的 gid。
+# —— 可填写 gid（填了就始终按 gid 抓，不会串表）
+# 你截图里那个链接的 gid=1286746668，示例先给到 raw to semi；其余可在侧栏补齐。
 SHEET_GIDS_DEFAULT = {
-    # 已知示例（你发来的链接里展示的 gid）
-    # 不确定这个 gid 对应哪个标签，请在侧栏“高级：gid 设置”中对号入座再保存
     "raw to semi": "1286746668",
-    # 其他标签可在侧栏逐一填写；留空就回退用标签名匹配（容易串表）
 }
 
 UNIT_SYNONYMS = {
-    "pcs": "piece", "pc": "piece", "pieces": "piece",
-    "bag": "bag", "bags": "bag",
-    "box": "box", "boxes": "box",
-    "btl": "bottle", "bottle": "bottle", "bottles": "bottle",
-    "can": "can", "cans": "can",
+    "pcs":"piece","pc":"piece","pieces":"piece",
+    "bag":"bag","bags":"bag","box":"box","boxes":"box",
+    "btl":"bottle","bottle":"bottle","bottles":"bottle",
+    "can":"can","cans":"can",
 }
-BASE_UNIT_SYNONYMS = {"pieces": "piece", "pcs": "piece", "pc": "piece"}
+BASE_UNIT_SYNONYMS = {"pieces":"piece","pcs":"piece","pc":"piece"}
 
-RE_UNITCALC = re.compile(
-    r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$',
-    re.IGNORECASE
-)
+RE_UNITCALC = re.compile(r'^\s*(\d+(?:\.\d+)?)\s*(g|ml|piece)s?\s*/\s*([a-zA-Z]+)\s*$', re.IGNORECASE)
 
-# ================= 工具函数 =================
+# ===================== 小工具 =====================
 def _norm(s):
     if pd.isna(s): return ""
     return str(s).strip()
 
 def _num(x):
     try:
-        if pd.isna(x) or str(x).strip() == "":
+        if pd.isna(x) or str(x).strip()=="":
             return 0.0
         return float(str(x).strip())
-    except Exception:
+    except:
         return 0.0
 
 def _clean_header(name: str) -> str:
@@ -83,11 +76,12 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
         "semi/100 g": "Semi/100g", "semi/unit": "Semi/Unit",
         "product ": "Product", " semi": "Semi",
     }
-    mapped = []
+    new_cols = []
     for c in df.columns:
         key = c.lower()
-        mapped.append(alias_map.get(key, c))
-    df.columns = [_clean_header(c) for c in mapped]
+        mapped = alias_map.get(key)
+        new_cols.append(mapped if mapped else c)
+    df.columns = [_clean_header(c) for c in new_cols]
 
     missing = [col for col in required_cols if col not in df.columns]
     if missing:
@@ -98,7 +92,8 @@ def normalize_and_validate(df: pd.DataFrame, required_cols: list, sheet_label: s
         for m in missing:
             df[m] = None
 
-    df = df[[*required_cols, *[c for c in df.columns if c not in required_cols]]]
+    ordered = [*required_cols, *[c for c in df.columns if c not in required_cols]]
+    df = df[ordered]
     return df
 
 def norm_unit(u: str) -> str:
@@ -107,7 +102,7 @@ def norm_unit(u: str) -> str:
     u = BASE_UNIT_SYNONYMS.get(u, u)
     return u
 
-# ================= 业务构建 =================
+# ===================== 业务逻辑 =====================
 def build_pack_map(dfs):
     pack_map = {}
     df = dfs["raw_unit"]
@@ -120,20 +115,22 @@ def build_pack_map(dfs):
         if not m:
             continue
         qty, base_u, pack_u = m.groups()
+        base_u = norm_unit(base_u)
+        pack_u = norm_unit(pack_u)
         pack_map[name.lower()] = {
             "base_qty": float(qty),
-            "base_unit": norm_unit(base_u),
-            "pack_unit": norm_unit(pack_u),
+            "base_unit": base_u,
+            "pack_unit": pack_u
         }
     return pack_map
 
 def convert_to_base(name, qty, unit, pack_map):
-    if qty == 0:
-        return 0.0
+    if qty == 0: return 0.0
     u = norm_unit(unit)
-    if u in ["g", "ml", "piece"]:
+    nm_key = _norm(name).lower()
+    if u in ["g","ml","piece"]:
         return qty
-    rule = pack_map.get(_norm(name).lower())
+    rule = pack_map.get(nm_key)
     if rule and u == rule["pack_unit"]:
         return qty * rule["base_qty"]
     return qty
@@ -219,7 +216,7 @@ def compare_and_report(theoretical_map, actual_map, label, pct_tol):
     )
     return html, df_out
 
-# ================= Google Sheets 拉取（支持 gid） =================
+# ===================== Google Sheets 抓取（支持 gid） =====================
 def gs_export_csv_url_by_gid(sheet_id: str, gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
@@ -230,7 +227,7 @@ def gs_export_csv_url_by_name(sheet_id: str, tab_name: str) -> str:
 def load_from_gs(sheet_id: str, name_to_gid: dict):
     dfs = {}
     errors = []
-    debug_capture = []  # 记录每张表实际抓到的前几列，方便排查是否串表
+    debug = []  # (tab, src, first_cols)
 
     for key, (tab, cols) in SHEETS.items():
         gid = name_to_gid.get(tab, "").strip()
@@ -243,8 +240,8 @@ def load_from_gs(sheet_id: str, name_to_gid: dict):
 
         try:
             df = pd.read_csv(url, dtype=str).fillna("")
-            debug_capture.append((tab, src_hint, list(df.columns)[:6]))
-
+            debug.append((tab, src_hint, list(df.columns)[:6]))
+            # 数量列尽量转数字，其余保持字符串
             for c in df.columns:
                 if c.lower() == "quantity":
                     df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -254,26 +251,7 @@ def load_from_gs(sheet_id: str, name_to_gid: dict):
             errors.append(f"读取 {tab} 失败（{src_hint}）：{e}")
             dfs[key] = pd.DataFrame(columns=cols)
 
-    return dfs, errors, debug_capture
-
-# ================= 上传 Excel（可选） =================
-def load_from_xlsx(file):
-    xls = pd.ExcelFile(file)
-    dfs = {}
-    errors = []
-    for key, (tab, cols) in SHEETS.items():
-        try:
-            if tab in xls.sheet_names:
-                df = pd.read_excel(xls, sheet_name=tab).dropna(how="all")
-                df = normalize_and_validate(df, cols, tab)
-                dfs[key] = df
-            else:
-                errors.append(f"上传文件缺少工作表：{tab}")
-                dfs[key] = pd.DataFrame(columns=cols)
-        except Exception as e:
-            errors.append(f"读取 {tab} 失败：{e}")
-            dfs[key] = pd.DataFrame(columns=cols)
-    return dfs, errors
+    return dfs, errors, debug
 
 def export_workbook(dfs):
     output = BytesIO()
@@ -282,6 +260,112 @@ def export_workbook(dfs):
             df = dfs[key].copy()
             for c in cols:
                 if c not in df.columns:
-                    df[c]
+                    df[c] = None
+            df = df[cols]
+            df.to_excel(w, sheet_name=sheet, index=False)
+    output.seek(0)
+    return output
+
+# ===================== 侧边栏（容差 & 高级 gid 设置） =====================
+with st.sidebar:
+    pct = st.slider("容差（±%）", 5, 50, 15, step=1) / 100
+    run = st.button("🚀 运行校验", use_container_width=True)
+
+    with st.expander("高级：gid 设置（填了就按 gid 抓，避免串表）", expanded=False):
+        gid_state = {}
+        for _key, (tab_name, _cols) in SHEETS.items():
+            val = st.text_input(f"{tab_name}", value=SHEET_GIDS_DEFAULT.get(tab_name, ""))
+            gid_state[tab_name] = val
+        # 缓存到 session，便于下次进入还在
+        if st.button("保存 gid 设置", use_container_width=True):
+            st.session_state["gid_map"] = gid_state
+            st.success("已保存。")
+
+gid_map = st.session_state.get("gid_map", SHEET_GIDS_DEFAULT)
+
+# ===================== 主区：运行 =====================
+col_app = st.container()
+with col_app:
+    st.subheader("校验结果")
+
+    if run:
+        with st.spinner("正在从 Google Sheets 抓取并校验…"):
+            dfs, errs, debug = load_from_gs(SHEET_ID, gid_map)
+            for tab, src, cols in debug:
+                st.caption(f"✔️ 抓取 `{tab}` via {src} → 首列预览：{cols}")
+
+            for msg in errs:
+                st.warning(msg)
+
+            # ——— 计算 ———
+            try:
+                pack_map = build_pack_map(dfs)
+                semi_raw, semi_semi, prod_semi, prod_raw = build_bom_maps(dfs)
+                prod_qty = read_production(dfs)
+                total_semi_need = expand_semi_demand(prod_qty, prod_semi, semi_semi)
+                theo_raw  = calc_theoretical_raw_need(prod_qty, prod_raw, total_semi_need, semi_raw)
+                theo_semi = total_semi_need
+            except Exception as e:
+                st.error(f"构建理论用量失败：{e}")
+                st.stop()
+
+            # 实际
+            try:
+                am_raw = defaultdict(float); purch = defaultdict(float); pm_raw = defaultdict(float)
+                for _, r in dfs["am_raw"].iterrows():
+                    am_raw[_norm(r["Ingredient"])] += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                for _, r in dfs["purch_raw"].iterrows():
+                    purch[_norm(r["Ingredient"])]   += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                for _, r in dfs["pm_raw"].iterrows():
+                    pm_raw[_norm(r["Ingredient"])]  += convert_to_base(r["Ingredient"], _num(r["Quantity"]), r.get("Unit",""), pack_map)
+                actual_raw = defaultdict(float)
+                for name in set(am_raw) | set(purch) | set(pm_raw):
+                    actual_raw[name] = am_raw.get(name,0.0) + purch.get(name,0.0) - pm_raw.get(name,0.0)
+
+                am_semi = defaultdict(float); pm_semi = defaultdict(float)
+                for _, r in dfs["am_semi"].iterrows():
+                    am_semi[_norm(r["Semi"])] += _num(r["Quantity"])
+                for _, r in dfs["pm_semi"].iterrows():
+                    pm_semi[_norm(r["Semi"])] += _num(r["Quantity"])
+                actual_semi = defaultdict(float)
+                for name in set(am_semi) | set(pm_semi):
+                    actual_semi[name] = am_semi.get(name,0.0) - pm_semi.get(name,0.0)
+            except Exception as e:
+                st.error(f"汇总实际用量失败：{e}")
+                st.stop()
+
+            # 报告
+            raw_html,  raw_df  = compare_and_report(theo_raw,  actual_raw,  "RAW",  pct)
+            semi_html, semi_df = compare_and_report(theo_semi, actual_semi, "SEMI", pct)
+
+        st.markdown(raw_html,  unsafe_allow_html=True)
+        st.markdown(semi_html, unsafe_allow_html=True)
+
+        if not raw_df.empty or not semi_df.empty:
+            out = pd.concat([raw_df, semi_df], ignore_index=True)
+            st.download_button(
+                "⬇️ 下载 Issues (CSV)",
+                out.to_csv(index=False).encode("utf-8"),
+                file_name="issues.csv",
+                mime="text/csv"
+            )
+
+# ===================== 帮助 =====================
+with st.expander("📘 填表规范（点开查看）"):
+    st.markdown("""
+- **必须的工作表与列名（严格匹配）**  
+  - raw unit calculation: `Name`, `Unit calculation` (如 `100g/can`), `Type`  
+  - raw to semi: `Semi/100g`, `Made From`, `Quantity`, `Unit`  
+  - semi to semi: `Semi/Unit`, `Made From`, `Quantity`, `Unit`  
+  - Semi to Product: `Product/Bowl`, `Made From`, `Quantity`, `Unit`  
+  - Raw to Product: `Product`, `Made From`, `Quantity`, `Unit`  
+  - AM_Opening_Raw / Purchases_Raw / PM_Ending_Raw: `Ingredient`, `Quantity`, `Unit`  
+  - AM_Opening_semi / PM_Ending_semi: `Semi`, `Quantity`, `Unit`  
+  - Dish_Production: `Product`, `Quantity`
+
+- **颜色规则**：红=用多（> +容差），绿=用少（< −容差）；当 **Theoretical=0** 且有消耗时，按 **±100%** 显示。  
+- **单位**：`g / ml / piece` 或包单位（bag/box/can/bottle…）；包单位换算在 **raw unit calculation** 的 `Unit calculation` 里配置（如 `100g/can`）。  
+- **列名清洗**：自动去不可见字符/多余空格，常见别名会被自动映射（如 `qty`→`Quantity`）；缺列会直接提示。
+""")
 
 
